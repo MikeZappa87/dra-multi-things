@@ -1,0 +1,29 @@
+# DeviceClass for general network devices (macvlan, ipvlan, veth, dummy)
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: network-devices
+spec:
+  selectors:
+  - cel:
+      expression: "device.driver == 'dra.example.com' && device.attributes['dra.example.com'].type == 'netdev'"
+---
+# DeviceClass for RDMA devices
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: rdma-devices
+spec:
+  selectors:
+  - cel:
+      expression: "device.driver == 'dra.example.com' && device.attributes['dra.example.com'].type == 'rdma'"
+---
+# DeviceClass for RoCE (combo) devices
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: roce-devices
+spec:
+  selectors:
+  - cel:
+      expression: "device.driver == 'dra.example.com' && (device.attributes['dra.example.com'].type == 'rdma' || device.attributes['dra.example.com'].type == 'combo')"

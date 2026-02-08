@@ -1,0 +1,82 @@
+# Two ResourceClaimTemplates - one per network device
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: data-net-claim
+  namespace: default
+spec:
+  spec:
+    devices:
+      requests:
+      - name: net
+        exactly:
+          deviceClassName: network-devices
+          selectors:
+          - cel:
+              expression: device.driver == "dra.example.com" && device.attributes["dra.example.com"].type == "netdev"
+      config:
+      - requests: ["net"]
+        opaque:
+          driver: dra.example.com
+          parameters:
+            type: netdev
+            netdev:
+              kind: macvlan
+              parent: eth0
+              mode: bridge
+              interfaceName: data0
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: control-net-claim
+  namespace: default
+spec:
+  spec:
+    devices:
+      requests:
+      - name: net
+        exactly:
+          deviceClassName: network-devices
+          selectors:
+          - cel:
+              expression: device.driver == "dra.example.com" && device.attributes["dra.example.com"].type == "netdev"
+      config:
+      - requests: ["net"]
+        opaque:
+          driver: dra.example.com
+          parameters:
+            type: netdev
+            netdev:
+              kind: dummy
+              interfaceName: ctrl0
+---
+# Pod with both claims
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: multi-nic-test
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: multi-nic-test
+  template:
+    metadata:
+      labels:
+        app: multi-nic-test
+    spec:
+      containers:
+        - name: app
+          image: nicolaka/netshoot
+          command: ["sleep", "infinity"]
+          resources:
+            claims:
+            - name: data-net
+            - name: control-net
+      resourceClaims:
+        - name: data-net
+          resourceClaimTemplateName: data-net-claim
+        - name: control-net
+          resourceClaimTemplateName: control-net-claim

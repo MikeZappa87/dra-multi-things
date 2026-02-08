@@ -1,0 +1,202 @@
+# =============================================================================
+# Example 1: Macvlan network interface
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dra-macvlan-test
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dra-macvlan-test
+  template:
+    metadata:
+      labels:
+        app: dra-macvlan-test
+    spec:
+      containers:
+        - name: test-container
+          image: nicolaka/netshoot
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Pod started: $(hostname)"
+              echo "Checking network interfaces..."
+              while true; do
+                echo "=== Network Interfaces ==="
+                ip link show
+                echo ""
+                echo "=== IP Addresses ==="
+                ip addr show
+                echo "=========================="
+                sleep 10
+              done
+          resources:
+            claims:
+            - name: macvlan-nic
+      resourceClaims:
+        - name: macvlan-nic
+          resourceClaimTemplateName: macvlan-claim-template
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: macvlan-claim-template
+  namespace: default
+spec:
+  spec:
+    devices:
+      requests:
+      - name: net
+        exactly:
+          deviceClassName: network-devices
+          selectors:
+          - cel:
+              expression: device.driver == "dra.example.com" && device.attributes["dra.example.com"].type == "netdev"
+      config:
+      - requests: ["net"]
+        opaque:
+          driver: dra.example.com
+          parameters:
+            type: netdev
+            netdev:
+              kind: macvlan
+              parent: eth0
+              mode: bridge
+              interfaceName: data0
+---
+# =============================================================================
+# Example 2: Dummy network interface (simple test)
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dra-network-test
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dra-network-test
+  template:
+    metadata:
+      labels:
+        app: dra-network-test
+    spec:
+      containers:
+        - name: test-container
+          image: nicolaka/netshoot
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Pod started: $(hostname)"
+              echo "Checking network interfaces..."
+              while true; do
+                echo "=== Network Interfaces ==="
+                ip link show
+                echo ""
+                echo "=== IP Addresses ==="
+                ip addr show
+                echo "=========================="
+                sleep 10
+              done
+        - name: test-container-2
+          image: nicolaka/netshoot
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Pod started: $(hostname)"
+              while true; do
+                echo "=== Network Interfaces ==="
+                ip link show
+                echo "=========================="
+                sleep 10
+              done
+          resources:
+            claims:
+            - name: nic-resource
+      resourceClaims:
+        - name: nic-resource
+          resourceClaimTemplateName: nic-claim-template
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: nic-claim-template
+  namespace: default
+spec:
+  spec:
+    devices:
+      requests:
+      - name: nic-request
+        exactly:
+          deviceClassName: network-devices
+          selectors:
+          - cel:
+              expression: device.driver == "dra.example.com" && device.attributes["dra.example.com"].type == "netdev"
+      config:
+      - requests: ["nic-request"]
+        opaque:
+          driver: dra.example.com
+          parameters:
+            type: netdev
+            netdev:
+              kind: dummy
+              interfaceName: net1
+---
+# =============================================================================
+# Example 3: RDMA uverbs device
+# =============================================================================
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: rdma-claim-template
+  namespace: default
+spec:
+  spec:
+    devices:
+      requests:
+      - name: rdma
+        exactly:
+          deviceClassName: rdma-devices
+          selectors:
+          - cel:
+              expression: device.driver == "dra.example.com" && device.attributes["dra.example.com"].type == "rdma"
+      config:
+      - requests: ["rdma"]
+        opaque:
+          driver: dra.example.com
+          parameters:
+            type: rdma
+---
+# =============================================================================
+# Example 4: RoCE (combo) device
+# =============================================================================
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: roce-claim-template
+  namespace: default
+spec:
+  spec:
+    devices:
+      requests:
+      - name: roce
+        exactly:
+          deviceClassName: roce-devices
+      config:
+      - requests: ["roce"]
+        opaque:
+          driver: dra.example.com
+          parameters:
+            type: combo
+            combo:
+              rdma: {}
+              netdev:
+                kind: dummy
+                interfaceName: rdma0
