@@ -46,9 +46,9 @@ func TestTracker_RemovePending(t *testing.T) {
 func TestTracker_ActiveLifecycle(t *testing.T) {
 	tr := NewRDMANetnsTracker()
 
-	tr.MarkActive("claim-1", "pod-uid-1", "mlx5_0")
-	tr.MarkActive("claim-2", "pod-uid-1", "mlx5_1")
-	tr.MarkActive("claim-3", "pod-uid-2", "mlx5_2")
+	tr.MarkActive("claim-1", "pod-uid-1", "mlx5_0", "/run/netns/pod1")
+	tr.MarkActive("claim-2", "pod-uid-1", "mlx5_1", "/run/netns/pod1")
+	tr.MarkActive("claim-3", "pod-uid-2", "mlx5_2", "/run/netns/pod2")
 
 	// GetActiveForPod should find the right entries.
 	pod1 := tr.GetActiveForPod("pod-uid-1")
@@ -95,7 +95,7 @@ func TestTracker_ActiveLifecycle(t *testing.T) {
 func TestTracker_String(t *testing.T) {
 	tr := NewRDMANetnsTracker()
 	tr.AddPending("c1", "mlx5_0")
-	tr.MarkActive("c2", "p1", "mlx5_1")
+	tr.MarkActive("c2", "p1", "mlx5_1", "/run/netns/p1")
 
 	s := tr.String()
 	if s != "RDMANetnsTracker{pending=1, active=1}" {
