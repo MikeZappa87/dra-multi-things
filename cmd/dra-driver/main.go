@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
@@ -19,6 +20,7 @@ import (
 	"github.com/example/dra-poc/pkg/handler/combo"
 	"github.com/example/dra-poc/pkg/handler/netdev"
 	"github.com/example/dra-poc/pkg/handler/rdma"
+	"github.com/example/dra-poc/pkg/ipam"
 	nriplugin "github.com/example/dra-poc/pkg/nri"
 )
 
@@ -62,8 +64,22 @@ func run(cmd *cobra.Command, args []string) {
 	// (which performs the actual netlink move when the pod sandbox is created).
 	rdmaTracker := nriplugin.NewRDMANetnsTracker()
 
+	// Create IPAM tracker and allocator for bridge-veth pool-based IP assignment
+	ipamStore, err := ipam.NewStore("")
+	if err != nil {
+		klog.Fatalf("Failed to initialize IPAM store: %v", err)
+	}
+	defer ipamStore.Close()
+
+	ipamAllocator, err := ipam.NewAllocator(ipamStore)
+	if err != nil {
+		klog.Fatalf("Failed to create IPAM allocator: %v", err)
+	}
+
+	ipamTracker := nriplugin.NewIPAMLeaseTracker(ipamAllocator)
+
 	// Build the handler registry with all supported device handlers
-	registry := buildHandlerRegistry(rdmaTracker)
+	registry := buildHandlerRegistry(rdmaTracker, ipamTracker)
 	for typ, kinds := range registry.ListRegistered() {
 		klog.Infof("Registered handlers for type=%s: %v", typ, kinds)
 	}
@@ -79,6 +95,25 @@ func run(cmd *cobra.Command, args []string) {
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		klog.Fatalf("Failed to create Kubernetes client: %v", err)
+	}
+	dynamicClient, err := dynamic.NewForConfig(config)
+	if err != nil {
+		klog.Fatalf("Failed to create dynamic Kubernetes client: %v", err)
+	}
+
+	// Load IPAM pools from ConfigMap and initialize them
+	pools, err := driver.LoadIPAMPoolsFromConfigMap(clientset)
+	if err != nil {
+		klog.Warningf("Failed to load IPAM pools: %v (continuing with no pools)", err)
+	} else {
+		// Create the pools in the allocator
+		for _, pool := range pools {
+			if err := ipamAllocator.CreatePool(pool); err != nil {
+				klog.Warningf("Failed to create IPAM pool %s: %v (pool may already exist)", pool.Name, err)
+			} else {
+				klog.Infof("Created IPAM pool: name=%s cidr=%s gateway=%s", pool.Name, pool.CIDR, pool.Gateway)
+			}
+		}
 	}
 
 	// Ensure the plugin directory exists so the kubelet plugin can create its
@@ -126,22 +161,21 @@ func run(cmd *cobra.Command, args []string) {
 		klog.Fatalf("Failed to start kubelet plugin: %v", err)
 	}
 
-	// Start the NRI plugin for RDMA netns management in exclusive mode.
-	// The plugin receives RunPodSandbox/StopPodSandbox events and moves
-	// RDMA devices into/out of pod network namespaces via netlink.
-	if rdma.DetectNetnsMode() == rdma.NetnsExclusive {
-		nriPlugin, err := nriplugin.NewPlugin(rdmaTracker)
-		if err != nil {
-			klog.Fatalf("Failed to create NRI plugin: %v", err)
-		}
-		go func() {
-			if err := nriPlugin.Run(ctx); err != nil {
-				klog.Errorf("NRI plugin exited: %v", err)
-			}
-		}()
-		defer nriPlugin.Stop()
-		klog.Info("NRI plugin started for exclusive RDMA netns mode")
+	// Start the NRI plugin for RDMA netns management and IPAM lease application.
+	// The plugin receives RunPodSandbox/StopPodSandbox events:
+	//  - RunPodSandbox: moves RDMA devices into pod netns (exclusive mode) and applies IPAM leases
+	//  - StopPodSandbox: returns RDMA devices to host netns and releases IPAM leases
+	nriPlugin, err := nriplugin.NewPluginWithTrackers(rdmaTracker, ipamTracker, clientset, dynamicClient)
+	if err != nil {
+		klog.Fatalf("Failed to create NRI plugin: %v", err)
 	}
+	go func() {
+		if err := nriPlugin.Run(ctx); err != nil {
+			klog.Errorf("NRI plugin exited: %v", err)
+		}
+	}()
+	defer nriPlugin.Stop()
+	klog.Info("NRI plugin started")
 
 	// Publish ResourceSlices
 	resources := driver.DiscoverResources(driverName, nodeName)
@@ -157,13 +191,14 @@ func run(cmd *cobra.Command, args []string) {
 }
 
 // buildHandlerRegistry creates and populates the handler registry with all device handlers
-func buildHandlerRegistry(rdmaTracker *nriplugin.RDMANetnsTracker) *handler.HandlerRegistry {
+func buildHandlerRegistry(rdmaTracker *nriplugin.RDMANetnsTracker, ipamTracker *nriplugin.IPAMLeaseTracker) *handler.HandlerRegistry {
 	registry := handler.NewHandlerRegistry()
 
 	// Network device handlers
 	registry.Register(&netdev.MacvlanHandler{})
 	registry.Register(&netdev.IpvlanHandler{})
 	registry.Register(&netdev.VethHandler{})
+	registry.Register(&netdev.BridgeVethHandler{IPAMTracker: ipamTracker})
 	registry.Register(&netdev.SriovVfHandler{})
 	registry.Register(&netdev.DummyHandler{})
 	registry.Register(&netdev.HostDeviceHandler{})

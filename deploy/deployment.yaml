@@ -150,7 +150,74 @@ spec:
               interfaceName: net1
 ---
 # =============================================================================
-# Example 3: RDMA uverbs device
+# Example 3: Linux bridge + veth with VLAN attachment
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dra-bridge-vlan-test
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dra-bridge-vlan-test
+  template:
+    metadata:
+      labels:
+        app: dra-bridge-vlan-test
+    spec:
+      containers:
+        - name: vlan-test
+          image: nicolaka/netshoot
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Pod started: $(hostname)"
+              echo "Checking interfaces..."
+              while true; do
+                ip link show
+                echo "---"
+                ip -d link show dev vlan100 2>/dev/null || true
+                sleep 10
+              done
+          resources:
+            claims:
+            - name: bridge-vlan-nic
+      resourceClaims:
+        - name: bridge-vlan-nic
+          resourceClaimTemplateName: bridge-vlan-claim-template
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: bridge-vlan-claim-template
+  namespace: default
+spec:
+  spec:
+    devices:
+      requests:
+      - name: net
+        exactly:
+          deviceClassName: network-devices
+          selectors:
+          - cel:
+              expression: device.driver == "dra.example.com" && device.attributes["dra.example.com"].type == "netdev"
+      config:
+      - requests: ["net"]
+        opaque:
+          driver: dra.example.com
+          parameters:
+            type: netdev
+            netdev:
+              kind: bridge-veth
+              bridgeName: br-vlan100
+              vlanId: 100
+              interfaceName: vlan100
+---
+# =============================================================================
+# Example 4: RDMA uverbs device
 # =============================================================================
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaimTemplate
@@ -175,7 +242,7 @@ spec:
             type: rdma
 ---
 # =============================================================================
-# Example 4: RoCE (combo) device
+# Example 5: RoCE (combo) device
 # =============================================================================
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaimTemplate

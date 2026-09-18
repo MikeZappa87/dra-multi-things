@@ -30,6 +30,7 @@ type PendingMove struct {
 // ActiveMove records a device that was successfully moved into a pod.
 type ActiveMove struct {
 	IBDev     string
+	ClaimUID  string
 	PodUID    string
 	NetnsPath string // Pod netns path — needed to re-enter and retrieve the device.
 }
@@ -101,6 +102,7 @@ func (t *RDMANetnsTracker) MarkActive(claimUID, podUID, ibDev, netnsPath string)
 	defer t.mu.Unlock()
 	t.active[claimUID] = &ActiveMove{
 		IBDev:     ibDev,
+		ClaimUID:  claimUID,
 		PodUID:    podUID,
 		NetnsPath: netnsPath,
 	}

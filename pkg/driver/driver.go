@@ -62,8 +62,11 @@ func (d *Driver) PrepareResourceClaims(ctx context.Context, claims []*resourceap
 
 		// Idempotent: if we already have state for this claim, return it.
 		if existing, ok := d.allocations[uid]; ok {
-			cdiDeviceID := fmt.Sprintf("%s/%s=%s", d.driverName, existing.Type, existing.DeviceName)
-			klog.Infof("Claim %s already prepared (restored state), returning cdi=%s", uid, cdiDeviceID)
+			cdiDeviceID := ""
+			if existing.CDIEnabled {
+				cdiDeviceID = fmt.Sprintf("%s/%s=%s", d.driverName, existing.Type, existing.DeviceName)
+			}
+			klog.Infof("Claim %s already prepared (restored state), cdi=%t", uid, existing.CDIEnabled)
 			results[rc.UID] = d.prepareResultFromAlloc(existing, cdiDeviceID)
 			continue
 		}
@@ -75,26 +78,28 @@ func (d *Driver) PrepareResourceClaims(ctx context.Context, claims []*resourceap
 			continue
 		}
 
-		// Create CDI spec from handler's edits
-		cdiDeviceID, err := d.createCDISpec(uid, result)
-		if err != nil {
-			d.unprepareAllocation(ctx, result.Allocation)
-			results[rc.UID] = kubeletplugin.PrepareResult{Err: err}
-			continue
-		}
-
-		d.allocations[uid] = result.Allocation
-
-		klog.Infof("Successfully prepared claim %s: pool=%s device=%s cdi=%s",
-			uid, result.PoolName, result.DeviceName, cdiDeviceID)
+		klog.Infof("Successfully prepared claim %s: pool=%s device=%s", uid, result.PoolName, result.DeviceName)
+		result.Allocation.CDIEnabled = result.CDIEdits != nil
 
 		results[rc.UID] = kubeletplugin.PrepareResult{
 			Devices: []kubeletplugin.Device{{
-				PoolName:     result.PoolName,
-				DeviceName:   result.DeviceName,
-				CDIDeviceIDs: []string{cdiDeviceID},
+				PoolName:   result.PoolName,
+				DeviceName: result.DeviceName,
 			}},
 		}
+		if result.CDIEdits != nil {
+			cdiDeviceID, err := d.createCDISpec(uid, result)
+			if err != nil {
+				d.unprepareAllocation(ctx, result.Allocation)
+				results[rc.UID] = kubeletplugin.PrepareResult{Err: err}
+				continue
+			}
+			results[rc.UID].Devices[0].CDIDeviceIDs = []string{cdiDeviceID}
+		}
+		if err := d.saveAllocation(uid, result.Allocation); err != nil {
+			klog.Warningf("Failed to save allocation state for claim %s: %v", uid, err)
+		}
+		d.allocations[uid] = result.Allocation
 	}
 
 	return results, nil
@@ -243,13 +248,16 @@ func (d *Driver) prepareResultFromAlloc(alloc *handler.AllocationInfo, cdiDevice
 	if p, ok := alloc.Metadata["poolName"]; ok {
 		poolName = p
 	}
-	return kubeletplugin.PrepareResult{
+	result := kubeletplugin.PrepareResult{
 		Devices: []kubeletplugin.Device{{
-			PoolName:     poolName,
-			DeviceName:   alloc.DeviceName,
-			CDIDeviceIDs: []string{cdiDeviceID},
+			PoolName:   poolName,
+			DeviceName: alloc.DeviceName,
 		}},
 	}
+	if cdiDeviceID != "" {
+		result.Devices[0].CDIDeviceIDs = []string{cdiDeviceID}
+	}
+	return result
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -286,10 +294,6 @@ func (d *Driver) createCDISpec(claimUID string, result *handler.PrepareResult) (
 
 	if err := os.WriteFile(cdiFilePath, data, 0644); err != nil {
 		return "", fmt.Errorf("failed to write CDI spec: %w", err)
-	}
-
-	if err := d.saveAllocation(claimUID, result.Allocation); err != nil {
-		klog.Warningf("Failed to save allocation state for claim %s: %v", claimUID, err)
 	}
 
 	cdiDeviceID := fmt.Sprintf("%s/%s=%s", d.driverName, result.Allocation.Type, result.DeviceName)

@@ -51,6 +51,7 @@ type UnprepareRequest struct {
 type AllocationInfo struct {
 	Type       DeviceType        `json:"type"`
 	Kind       string            `json:"kind"`
+	CDIEnabled bool              `json:"cdiEnabled"`
 	ClaimUID   string            `json:"claimUID"`
 	DeviceName string            `json:"deviceName"`
 	Metadata   map[string]string `json:"metadata"`
@@ -66,14 +67,26 @@ type DeviceConfig struct {
 
 // NetdevConfig holds network device specific configuration.
 type NetdevConfig struct {
-	Kind          string `json:"kind"`
-	InterfaceName string `json:"interfaceName,omitempty"`
-	MTU           int    `json:"mtu,omitempty"`
-	Parent        string `json:"parent,omitempty"`
-	Mode          string `json:"mode,omitempty"`
-	VFIndex       int    `json:"vfIndex,omitempty"`
-	HostDevice    string `json:"hostDevice,omitempty"` // host-device: name of a pre-existing interface to move into the pod
-	Pkey          int    `json:"pkey,omitempty"`       // ipoib: partition key (e.g. 0x8001)
+	Kind          string      `json:"kind"`
+	InterfaceName string      `json:"interfaceName,omitempty"`
+	MTU           int         `json:"mtu,omitempty"`
+	Parent        string      `json:"parent,omitempty"`
+	Mode          string      `json:"mode,omitempty"`
+	VFIndex       int         `json:"vfIndex,omitempty"`
+	HostDevice    string      `json:"hostDevice,omitempty"` // host-device: name of a pre-existing interface to move into the pod
+	BridgeName    string      `json:"bridgeName,omitempty"` // bridge-veth: host bridge to attach the veth to
+	VLANID        int         `json:"vlanId,omitempty"`     // bridge-veth: VLAN ID to assign to the bridge port
+	PoolName      string      `json:"poolName,omitempty"`   // ipam: name of the IPAM pool to allocate from
+	CIDR          string      `json:"cidr,omitempty"`       // ipam: CIDR for a pod-side IP address, e.g. 10.240.0.0/24
+	Gateway       string      `json:"gateway,omitempty"`    // ipam: gateway for the interface
+	Routes        []RouteSpec `json:"routes,omitempty"`     // ipam: explicit routes to add inside the pod netns
+	Pkey          int         `json:"pkey,omitempty"`       // ipoib: partition key (e.g. 0x8001)
+}
+
+// RouteSpec encodes a static route intended for a pod-side interface.
+type RouteSpec struct {
+	Dst string `json:"dst"`
+	Via string `json:"via,omitempty"`
 }
 
 // RDMAConfig holds RDMA device specific configuration.

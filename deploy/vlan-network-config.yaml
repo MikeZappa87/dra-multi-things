@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dra-vlan-network-config
+  namespace: dra-system
+  labels:
+    app: dra-vlan-network-config
+spec:
+  selector:
+    matchLabels:
+      app: dra-vlan-network-config
+  template:
+    metadata:
+      labels:
+        app: dra-vlan-network-config
+    spec:
+      hostNetwork: true
+      hostPID: true
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: configure
+          image: nicolaka/netshoot:latest
+          securityContext:
+            privileged: true
+          command:
+            - sh
+            - -c
+            - |
+              while true; do
+                if nsenter -t 1 -m -n -- /usr/sbin/iptables-legacy -t nat -C KIND-MASQ-AGENT -d 10.240.0.0/24 -j RETURN 2>/dev/null; then
+                  :
+                else
+                  nsenter -t 1 -m -n -- /usr/sbin/iptables-legacy -t nat -I KIND-MASQ-AGENT 1 -d 10.240.0.0/24 -j RETURN 2>/dev/null || true
+                fi
+                sleep 10
+              done

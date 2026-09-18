@@ -37,16 +37,20 @@ load:
 
 deploy:
 	kubectl apply -f deploy/namespace.yaml
+	kubectl apply -f deploy/ipam-config.yaml
 	kubectl apply -f deploy/driver.yaml
 	kubectl apply -f deploy/resourceclass.yaml
+	kubectl apply -f deploy/vlan-network-config.yaml
 	kubectl wait --for=condition=Ready pod -l app=$(DRIVER_NAME) -n $(NAMESPACE) --timeout=60s || true
 
 undeploy:
 	-kubectl delete -f deploy/deployment.yaml --ignore-not-found
+	-kubectl delete -f deploy/ipam-config.yaml --ignore-not-found
 	-kubectl delete resourceclaims --all --ignore-not-found
 	-kubectl delete -f deploy/resourceclass.yaml --ignore-not-found
 	-kubectl delete -f deploy/driver.yaml --ignore-not-found
 	-kubectl delete -f deploy/namespace.yaml --ignore-not-found
+	-kubectl delete -f deploy/vlan-network-config.yaml --ignore-not-found
 
 logs:
 	kubectl logs -n $(NAMESPACE) -l app=$(DRIVER_NAME) -f

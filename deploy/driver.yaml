@@ -16,6 +16,9 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: ["resource.k8s.io"]
     resources: ["resourceclaims", "resourceclaimtemplates", "deviceclasses", "podschedulingcontexts", "resourceslices"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
@@ -86,6 +89,9 @@ spec:
               mountPath: /etc/cdi
             - name: nri-socket
               mountPath: /var/run/nri
+            - name: netns-dir
+              mountPath: /var/run/netns
+              mountPropagation: Bidirectional
           resources:
             requests:
               cpu: 10m
@@ -109,6 +115,10 @@ spec:
         - name: nri-socket
           hostPath:
             path: /var/run/nri
+            type: DirectoryOrCreate
+        - name: netns-dir
+          hostPath:
+            path: /var/run/netns
             type: DirectoryOrCreate
       tolerations:
         - operator: Exists

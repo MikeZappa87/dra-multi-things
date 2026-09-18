@@ -5,12 +5,20 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/containerd/nri/pkg/api"
 	"github.com/containerd/nri/pkg/stub"
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
+	resourceapi "k8s.io/api/resource/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
+
+	"github.com/example/dra-poc/pkg/ipam"
 )
 
 const (
@@ -18,20 +26,32 @@ const (
 	pluginIdx  = "90" // Run late — after most other NRI plugins.
 )
 
-// Plugin is an NRI plugin that moves RDMA devices into pod network namespaces
-// in exclusive RDMA netns mode.
+// Plugin is an NRI plugin that handles device namespace moves and IPAM lease application.
 //
 // It implements:
-//   - RunPodInterface  — move RDMA devices into the new sandbox netns
-//   - StopPodInterface — move RDMA devices back to the host (init) netns
+//   - RunPodInterface  — move RDMA devices into the new sandbox netns and apply IPAM leases
+//   - StopPodInterface — move RDMA devices back to the host (init) netns and release IPAM leases
 type Plugin struct {
-	stub    stub.Stub
-	tracker *RDMANetnsTracker
+	stub          stub.Stub
+	rdmaTracker   *RDMANetnsTracker
+	ipamTracker   *IPAMLeaseTracker
+	kubeClient    kubernetes.Interface
+	dynamicClient dynamic.Interface
 }
 
-// NewPlugin creates a new NRI plugin wired to the given tracker.
+// NewPlugin creates a new NRI plugin wired to the RDMA tracker only (backward compat).
 func NewPlugin(tracker *RDMANetnsTracker) (*Plugin, error) {
-	p := &Plugin{tracker: tracker}
+	return NewPluginWithTrackers(tracker, nil, nil, nil)
+}
+
+// NewPluginWithTrackers creates a new NRI plugin wired to both RDMA and IPAM trackers.
+func NewPluginWithTrackers(rdmaTracker *RDMANetnsTracker, ipamTracker *IPAMLeaseTracker, kubeClient kubernetes.Interface, dynamicClient dynamic.Interface) (*Plugin, error) {
+	p := &Plugin{
+		rdmaTracker:   rdmaTracker,
+		ipamTracker:   ipamTracker,
+		kubeClient:    kubeClient,
+		dynamicClient: dynamicClient,
+	}
 
 	opts := []stub.Option{
 		stub.WithPluginName(pluginName),
@@ -62,9 +82,9 @@ func (p *Plugin) Stop() {
 // ──────────────────────────────────────────────────────────────────────────────
 
 // RunPodSandbox is called after the pod sandbox (and its netns) is created.
-// We look for pending RDMA moves that belong to this pod's claims and execute
-// them now via netlink.
-func (p *Plugin) RunPodSandbox(_ context.Context, pod *api.PodSandbox) error {
+// We look for pending RDMA moves and IPAM leases that belong to this pod's claims,
+// and execute them now via netlink.
+func (p *Plugin) RunPodSandbox(ctx context.Context, pod *api.PodSandbox) error {
 	podUID := pod.GetUid()
 	podName := fmt.Sprintf("%s/%s", pod.GetNamespace(), pod.GetName())
 
@@ -73,92 +93,209 @@ func (p *Plugin) RunPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 	//   resource.kubernetes.io/<container>: <claim-uid>[,<claim-uid>...]
 	claimUIDs := extractClaimUIDs(pod.GetAnnotations())
 	if len(claimUIDs) == 0 {
-		return nil // No DRA claims — nothing to do.
+		claimUIDs = p.claimUIDsFromKubernetes(ctx, pod.GetNamespace(), pod.GetName())
 	}
+	klog.Infof("RunPodSandbox received: pod=%s uid=%s annotations=%d claimUIDs=%d netns=%s", podName, podUID, len(pod.GetAnnotations()), len(claimUIDs), getNetNSPath(pod))
 
-	// Check for pending moves matching these claims.
-	moves := p.tracker.ConsumePendingForClaims(claimUIDs)
-	if len(moves) == 0 {
-		return nil // No RDMA devices need moving.
-	}
-
-	// Get a handle to the pod's network namespace.
-	var (
-		podNS netns.NsHandle
-		err   error
-	)
+	// Get the pod's network namespace path
 	netnsPath := getNetNSPath(pod)
-	if netnsPath != "" {
-		podNS, err = netns.GetFromPath(netnsPath)
-	} else {
-		klog.Warningf("Pod %s: no netns path available, cannot move RDMA devices", podName)
-		// Re-register the moves so they aren't lost.
-		for _, m := range moves {
-			p.tracker.AddPending(m.ClaimUID, m.IBDev)
+
+	// Handle RDMA device moves (if tracker is available)
+	if p.rdmaTracker != nil {
+		moves := p.rdmaTracker.ConsumePendingForClaims(claimUIDs)
+		if len(moves) > 0 {
+			if netnsPath == "" {
+				klog.Warningf("Pod %s: no netns path available, cannot move RDMA devices", podName)
+				for _, m := range moves {
+					p.rdmaTracker.AddPending(m.ClaimUID, m.IBDev)
+
+				}
+			} else {
+				p.applyRDMAMoves(pod, moves, podName, podUID)
+			}
 		}
-		return nil
 	}
-	if err != nil {
-		klog.Errorf("Pod %s: failed to get netns (path=%q pid=%d): %v", podName, netnsPath, pod.GetPid(), err)
-		for _, m := range moves {
-			p.tracker.AddPending(m.ClaimUID, m.IBDev)
-		}
-		return fmt.Errorf("get pod netns: %w", err)
-	}
-	defer podNS.Close()
 
-	// Move each RDMA device into the pod's netns.
-	for _, m := range moves {
-		rdmaLink, err := netlink.RdmaLinkByName(m.IBDev)
-		if err != nil {
-			klog.Errorf("Pod %s: RDMA link %s not found: %v", podName, m.IBDev, err)
-			continue
-		}
+	// Handle IPAM lease application (if tracker is available and netns path is known)
+	// If no claim UIDs were found in annotations, try consuming ALL pending leases
+	// (this is a fallback for the case where annotations aren't set)
+	if p.ipamTracker != nil && netnsPath != "" {
+		leases := p.ipamTracker.ConsumePendingForClaims(claimUIDs)
 
-		if err := netlink.RdmaLinkSetNsFd(rdmaLink, uint32(podNS)); err != nil {
-			klog.Errorf("Pod %s: failed to move RDMA device %s to netns: %v", podName, m.IBDev, err)
-			continue
-		}
+		for claimUID, lease := range leases {
+			lease.PodUID = podUID
+			lease.NetnsPath = netnsPath
 
-		p.tracker.MarkActive(m.ClaimUID, podUID, m.IBDev, netnsPath)
-		klog.Infof("Moved RDMA device %s into pod %s netns (claim=%s)", m.IBDev, podName, m.ClaimUID)
+			if lease.HostInterface != "" {
+				if err := MoveInterfaceToPodNetns(netnsPath, lease.HostInterface, lease.Interface); err != nil {
+					klog.Errorf("Pod %s: failed to move interface %s: %v", podName, lease.HostInterface, err)
+					if err := p.ipamTracker.AddPending(claimUID, lease); err != nil {
+						klog.Errorf("Pod %s: failed to re-register pending lease: %v", podName, err)
+					}
+					continue
+				}
+			}
+
+			klog.Infof("Applying IPAM lease to pod %s: claim=%s iface=%s ip=%s", podName, claimUID, lease.Interface, lease.IP)
+			if err := applyLeaseWithRetry(netnsPath, lease.Interface, lease); err != nil {
+				klog.Errorf("Pod %s: failed to apply IPAM lease for claim %s: %v", podName, claimUID, err)
+				// Re-register as pending so the lease isn't lost
+				if err := p.ipamTracker.AddPending(claimUID, lease); err != nil {
+					klog.Errorf("Pod %s: failed to re-register pending lease: %v", podName, err)
+				}
+			} else {
+				p.ipamTracker.MarkActive(claimUID, lease)
+				klog.Infof("Applied IPAM lease to pod %s: claim=%s pool=%s ip=%s", podName, claimUID, lease.PoolName, lease.IP)
+			}
+		}
 	}
 
 	return nil
 }
 
-// StopPodSandbox is called when a pod is stopping.  This is a backup path for
-// returning RDMA devices to the host netns.  The primary return happens in
+func applyLeaseWithRetry(netnsPath, iface string, lease *ipam.Lease) error {
+	var err error
+	for attempt := 0; attempt < 20; attempt++ {
+		err = ApplyLeaseToPodNetns(netnsPath, iface, lease)
+		if err == nil || !strings.Contains(err.Error(), "Link not found") {
+			return err
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return err
+}
+
+// StopPodSandbox is called when a pod is stopping. This handles both RDMA device
+// return to host netns and IPAM lease cleanup. The primary cleanup happens in
 // Unprepare (called by the kubelet before StopPodSandbox), which removes the
-// tracker entry — so in the normal flow RemoveActiveForPod returns nothing.
-//
-// This handler catches edge cases: kubelet crash between container stop and
-// Unprepare, Unprepare failure with a later retry, or rolling driver updates
-// where in-memory state was lost.
+// tracker entries — so in the normal flow, StopPodSandbox is a backup cleanup path.
 func (p *Plugin) StopPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 	podUID := pod.GetUid()
 	podName := fmt.Sprintf("%s/%s", pod.GetNamespace(), pod.GetName())
 
-	moves := p.tracker.RemoveActiveForPod(podUID)
-	if len(moves) == 0 {
+	// Handle RDMA device return (if tracker is available)
+	if p.rdmaTracker != nil {
+		rmoves := p.rdmaTracker.RemoveActiveForPod(podUID)
+		if len(rmoves) > 0 {
+			p.cleanupRDMADevices(pod, rmoves, podName)
+		}
+	}
+
+	// Handle IPAM lease cleanup (if tracker is available)
+	if p.ipamTracker != nil {
+		leases, err := p.ipamTracker.RemoveActiveForPod(podUID)
+		if err != nil {
+			klog.Errorf("Pod %s: failed to remove active IPAM leases: %v", podName, err)
+			return err
+		}
+
+		// Release the IPs back to the pool
+		for claimUID, lease := range leases {
+			if err := p.ipamTracker.Allocator.Release(claimUID); err != nil {
+				klog.Errorf("Pod %s: failed to release IPAM lease for claim %s: %v", podName, claimUID, err)
+			} else {
+				klog.Infof("Released IPAM lease for claim %s: ip=%s", claimUID, lease.IP)
+			}
+		}
+	}
+
+	return nil
+}
+
+func (p *Plugin) claimUIDsFromKubernetes(ctx context.Context, namespace, podName string) []string {
+	if p.kubeClient == nil || p.dynamicClient == nil {
+		return nil
+	}
+	pod, err := p.kubeClient.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
+	if err != nil {
+		klog.Warningf("Pod %s/%s: failed to look up pod claims: %v", namespace, podName, err)
 		return nil
 	}
 
+	claimResource := schema.GroupVersionResource{
+		Group: "resource.k8s.io", Version: resourceapi.SchemeGroupVersion.Version, Resource: "resourceclaims",
+	}
+	claimUIDs := make([]string, 0, len(pod.Status.ResourceClaimStatuses))
+	for _, status := range pod.Status.ResourceClaimStatuses {
+		if status.ResourceClaimName == nil || *status.ResourceClaimName == "" {
+			continue
+		}
+		claim, err := p.dynamicClient.Resource(claimResource).Namespace(namespace).Get(ctx, *status.ResourceClaimName, metav1.GetOptions{})
+		if err != nil {
+			klog.Warningf("Pod %s/%s: failed to look up ResourceClaim %s: %v", namespace, podName, *status.ResourceClaimName, err)
+			continue
+		}
+		claimUIDs = append(claimUIDs, string(claim.GetUID()))
+	}
+	return claimUIDs
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// RDMA device handling
+// ──────────────────────────────────────────────────────────────────────────────
+
+// applyRDMAMoves moves RDMA devices from pending list into a pod's netns.
+func (p *Plugin) applyRDMAMoves(pod *api.PodSandbox, moves []*PendingMove, podName, podUID string) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	hostNS, err := netns.Get()
+	if err != nil {
+		klog.Errorf("Pod %s: could not get host netns: %v", podName, err)
+		return
+	}
+	defer hostNS.Close()
+
+	netnsPath := getNetNSPath(pod)
+	if netnsPath == "" {
+		klog.Errorf("Pod %s: no netns path available", podName)
+		return
+	}
+
+	podNS, err := netns.GetFromPath(netnsPath)
+	if err != nil {
+		klog.Errorf("Pod %s: could not open netns %s: %v", podName, netnsPath, err)
+		return
+	}
+	defer podNS.Close()
+
+	if err := netns.Set(podNS); err != nil {
+		klog.Errorf("Pod %s: failed to enter pod netns: %v", podName, err)
+		return
+	}
+	defer netns.Set(hostNS) // restore to host netns before unlocking the OS thread
+
+	for _, m := range moves {
+		rdmaLink, err := netlink.RdmaLinkByName(m.IBDev)
+		if err != nil {
+			klog.Errorf("Pod %s: RDMA link %s not found in host: %v", podName, m.IBDev, err)
+			continue
+		}
+
+		if err := netlink.RdmaLinkSetNsFd(rdmaLink, uint32(podNS)); err != nil {
+			klog.Errorf("Pod %s: failed to move RDMA device %s to pod netns: %v", podName, m.IBDev, err)
+			p.rdmaTracker.AddPending(m.ClaimUID, m.IBDev)
+		} else {
+			p.rdmaTracker.MarkActive(m.ClaimUID, podUID, m.IBDev, netnsPath)
+			klog.Infof("Moved RDMA device %s to pod %s", m.IBDev, podName)
+		}
+	}
+}
+
+// cleanupRDMADevices returns RDMA devices from a pod's namespace back to the host.
+func (p *Plugin) cleanupRDMADevices(pod *api.PodSandbox, moves []*ActiveMove, podName string) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
 	// Always use /proc/1/ns/net for the init netns — netns.Get() returns the
-	// calling thread's netns which may have been switched by another goroutine.
+	// current namespace when there are no changes pending.  We want to guarantee
+	// the host (init) namespace, so we hard-code the path.
 	hostNS, err := netns.GetFromPath("/proc/1/ns/net")
 	if err != nil {
-		klog.Errorf("Failed to open init netns (/proc/1/ns/net) for RDMA device return: %v", err)
-		return nil // Don't fail the pod stop — the kernel may auto-return them.
+		klog.Errorf("Pod %s: could not get host netns: %v", podName, err)
+		return
 	}
 	defer hostNS.Close()
 
-	// Enter the pod's netns so that RdmaLinkByName can see the devices that
-	// were moved there.  In exclusive mode, RDMA devices are invisible from
-	// any other netns.
 	enteredPodNS := false
 	netnsPath := getNetNSPath(pod)
 	if netnsPath != "" {
@@ -193,16 +330,9 @@ func (p *Plugin) StopPodSandbox(_ context.Context, pod *api.PodSandbox) error {
 			klog.Infof("Returned RDMA device %s to host netns (pod %s stopped)", m.IBDev, podName)
 		}
 	}
-
-	return nil
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ──────────────────────────────────────────────────────────────────────────────
-
-// getNetNSPath extracts the network namespace path from a PodSandbox's Linux
-// namespace list.
+// getNetNSPath extracts the network namespace path from a pod's Linux info.
 func getNetNSPath(pod *api.PodSandbox) string {
 	linux := pod.GetLinux()
 	if linux == nil {
@@ -265,26 +395,24 @@ func extractUUIDs(s string) []string {
 	return uuids
 }
 
-// isUUID checks if a string matches the UUID format (8-4-4-4-12 hex digits).
+// isUUID checks if a string looks like a UUID.
 func isUUID(s string) bool {
 	if len(s) != 36 {
 		return false
 	}
-	for i, c := range s {
-		switch i {
-		case 8, 13, 18, 23:
-			if c != '-' {
-				return false
-			}
-		default:
-			if !isHexDigit(byte(c)) {
+	parts := strings.Split(s, "-")
+	if len(parts) != 5 {
+		return false
+	}
+	if len(parts[0]) != 8 || len(parts[1]) != 4 || len(parts[2]) != 4 || len(parts[3]) != 4 || len(parts[4]) != 12 {
+		return false
+	}
+	for _, part := range parts {
+		for _, ch := range part {
+			if !((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')) {
 				return false
 			}
 		}
 	}
 	return true
-}
-
-func isHexDigit(c byte) bool {
-	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 }

@@ -2,7 +2,10 @@ package netdev
 
 import (
 	"context"
+	"errors"
 	"os"
+	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/vishvananda/netlink"
@@ -85,6 +88,23 @@ func TestVethHandler_Validate(t *testing.T) {
 	}
 }
 
+func TestBridgeVethHandler_Validate(t *testing.T) {
+	h := &BridgeVethHandler{}
+	if err := h.Validate(context.Background(), &handler.DeviceConfig{}); err == nil {
+		t.Error("expected error when Netdev is nil")
+	}
+	if err := h.Validate(context.Background(), &handler.DeviceConfig{
+		Netdev: &handler.NetdevConfig{Kind: "bridge-veth"},
+	}); err == nil {
+		t.Error("expected error when bridge name is empty")
+	}
+	if err := h.Validate(context.Background(), &handler.DeviceConfig{
+		Netdev: &handler.NetdevConfig{Kind: "bridge-veth", BridgeName: "br-vlan-test"},
+	}); err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
 func TestSriovVfHandler_Validate(t *testing.T) {
 	h := &SriovVfHandler{}
 	if err := h.Validate(context.Background(), &handler.DeviceConfig{}); err == nil {
@@ -128,6 +148,7 @@ func TestHandlerMetadata(t *testing.T) {
 		{"macvlan", &MacvlanHandler{}, handler.DeviceTypeNetdev, []string{"macvlan"}},
 		{"ipvlan", &IpvlanHandler{}, handler.DeviceTypeNetdev, []string{"ipvlan"}},
 		{"veth", &VethHandler{}, handler.DeviceTypeNetdev, []string{"veth"}},
+		{"bridge-veth", &BridgeVethHandler{}, handler.DeviceTypeNetdev, []string{"bridge-veth"}},
 		{"sriov-vf", &SriovVfHandler{}, handler.DeviceTypeNetdev, []string{"sriov-vf"}},
 		{"host-device", &HostDeviceHandler{}, handler.DeviceTypeNetdev, []string{"host-device"}},
 		{"ipoib", &IpoibHandler{}, handler.DeviceTypeNetdev, []string{"ipoib"}},
@@ -167,6 +188,9 @@ func TestDummyHandler_PrepareAndUnprepare(t *testing.T) {
 
 	result, err := h.Prepare(ctx, req)
 	if err != nil {
+		if errors.Is(err, syscall.EINVAL) || strings.Contains(err.Error(), "VLAN filtering unsupported") || strings.Contains(err.Error(), "VLAN tagging unsupported") {
+			t.Skipf("kernel does not support bridge VLAN configuration: %v", err)
+		}
 		t.Fatalf("Prepare failed: %v", err)
 	}
 	defer cleanupLink(result.DeviceName)
@@ -280,6 +304,63 @@ func TestVethHandler_PrepareAndUnprepare(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("Unprepare failed: %v", err)
+	}
+	if _, err := netlink.LinkByName(hostEnd); err == nil {
+		t.Error("host veth end should be gone")
+	}
+	if _, err := netlink.LinkByName(containerEnd); err == nil {
+		t.Error("container veth end should be gone")
+	}
+}
+
+func TestBridgeVethHandler_PrepareAndUnprepare(t *testing.T) {
+	skipUnlessRoot(t)
+	h := &BridgeVethHandler{}
+	ctx := context.Background()
+
+	req := &handler.PrepareRequest{
+		ClaimUID: "bridgevlan-1111-2222-3333-444444444444",
+		Config: &handler.DeviceConfig{
+			Type: handler.DeviceTypeNetdev,
+			Netdev: &handler.NetdevConfig{
+				Kind:          "bridge-veth",
+				BridgeName:    "br-vlan-test",
+				InterfaceName: "vlan100",
+				VLANID:        100,
+			},
+		},
+	}
+
+	result, err := h.Prepare(ctx, req)
+	if err != nil {
+		t.Fatalf("Prepare failed: %v", err)
+	}
+	defer cleanupLink(result.Allocation.Metadata["bridgeName"])
+	defer cleanupLink(result.Allocation.Metadata["hostEnd"])
+
+	bridgeName := result.Allocation.Metadata["bridgeName"]
+	hostEnd := result.Allocation.Metadata["hostEnd"]
+	containerEnd := result.Allocation.Metadata["containerEnd"]
+
+	if _, err := netlink.LinkByName(bridgeName); err != nil {
+		t.Fatalf("bridge %s not found: %v", bridgeName, err)
+	}
+	if _, err := netlink.LinkByName(hostEnd); err != nil {
+		t.Fatalf("host veth end %s not found: %v", hostEnd, err)
+	}
+	if _, err := netlink.LinkByName(containerEnd); err != nil {
+		t.Fatalf("container veth end %s not found: %v", containerEnd, err)
+	}
+	if result.CDIEdits != nil {
+		t.Fatal("bridge-veth should not use CDI edits")
+	}
+
+	err = h.Unprepare(ctx, &handler.UnprepareRequest{ClaimUID: req.ClaimUID, Allocation: result.Allocation})
+	if err != nil {
+		t.Fatalf("Unprepare failed: %v", err)
+	}
+	if _, err := netlink.LinkByName(bridgeName); err == nil {
+		t.Error("bridge should be gone")
 	}
 	if _, err := netlink.LinkByName(hostEnd); err == nil {
 		t.Error("host veth end should be gone")
